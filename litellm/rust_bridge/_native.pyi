@@ -8,13 +8,17 @@ from pydantic import JsonValue
 from litellm.rust_bridge.execution import Execution
 from litellm.rust_bridge.public_call import NativeCall
 
+_T_co = TypeVar("_T_co", covariant=True)
+
 class RustBridgeDeclined(Exception): ...
 class RustUpstreamError(Exception): ...
 class ForkedAfterNativeRuntimeStarted(RuntimeError): ...
 class ProcessReservedForForking(RuntimeError): ...
+class NativeRedisStoreError(Exception): ...
 
 def trace_encode_error(message: str) -> bytes: ...
 def bundled_model_cost_map() -> bytes: ...
+def native_redis_breaker_states() -> list[str]: ...
 
 @final
 class NativeClickHouseSpendConfig:
@@ -25,6 +29,43 @@ class NativeClickHouseSpendStorage:
     def __new__(cls, config: NativeClickHouseSpendConfig) -> NativeClickHouseSpendStorage: ...
     def ensure_schema(self) -> Future[None]: ...
     def insert_rows(self, rows: Sequence[Mapping[str, object]]) -> Future[None]: ...
+
+@final
+class NativeRedisClient:
+    def __new__(cls, _uninstantiable: Never, /) -> Never: ...
+    @staticmethod
+    def connect(
+        redis_kwargs: Mapping[str, object],
+        *,
+        default_ttl_seconds: float,
+        namespace: str | None = None,
+        breaker: tuple[int, float, float] | None = None,
+    ) -> NativeRedisClient | None: ...
+    @property
+    def default_ttl_seconds(self) -> float: ...
+
+@final
+class NativeRequestRedis:
+    def __new__(cls, post_call_deadline_seconds: float) -> NativeRequestRedis: ...
+    def flush_pre(self) -> Future[None]: ...
+    def flush_post(self) -> Future[None]: ...
+
+@final
+class NativePending(Generic[_T_co]):
+    def resolve(self) -> Future[_T_co]: ...
+
+class NativeSend:
+    @final
+    class Now(NativeSend):
+        def __new__(cls) -> NativeSend.Now: ...
+
+    @final
+    class PreCall(NativeSend):
+        def __new__(cls, request: NativeRequestRedis, /) -> NativeSend.PreCall: ...
+
+    @final
+    class PostCall(NativeSend):
+        def __new__(cls, request: NativeRequestRedis, /) -> NativeSend.PostCall: ...
 
 @final
 class NativeDatabase:
@@ -216,6 +257,10 @@ __all__ = [
     "NativeClickHouseSpendStorage",
     "NativeDatabase",
     "NativeDiagnosticProcessor",
+    "NativePending",
+    "NativeRedisClient",
+    "NativeRedisStoreError",
+    "NativeRequestRedis",
     "ProcessReservedForForking",
     "ResponsesWebSocketConnection",
     "RouterCall",
@@ -235,6 +280,7 @@ __all__ = [
     "embedding",
     "gil_stats",
     "messages",
+    "native_redis_breaker_states",
     "ocr",
     "ocr_health_check_document",
     "ocr_passthrough_response",
