@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
     from litellm.messages.dispatch import MessagesResult
+    from litellm.redis.stores.router_usage import RouterUsage
     from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
     from litellm.router import Router
     from litellm.router_strategy.adaptive_router.adaptive_router import AdaptiveRouter
@@ -1260,6 +1261,11 @@ class RouterHealth:
     def cooldowns(self) -> "CooldownCache":
         """The cooldown store (was ``cooldown_cache``)."""
         return self._router._core_cooldown_cache
+
+    @property
+    def usage_store(self) -> "RouterUsage":
+        """The per-minute tpm/rpm counters of every deployment, in memory plus the router's Redis."""
+        return self._router._core_usage_store
 
     @property
     def health_checks(self) -> "DeploymentHealthCache":

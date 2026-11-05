@@ -8,6 +8,7 @@ import pytest
 
 import litellm
 from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+from litellm.redis.stores.router_usage import UsageCounter
 from litellm.router_core import RouterCore
 from litellm.types.router import Deployment, RouterCacheEnum
 from litellm.utils import get_utc_datetime
@@ -38,8 +39,13 @@ def _minute() -> str:
 
 
 async def _count(core: RouterCore, kind: RouterCacheEnum, deployment_id: str, model: str, value: int) -> None:
-    key = kind.value.format(id=deployment_id, model=model, current_minute=_minute())
-    await core.health().store.async_set_cache(key, value)
+    match kind:
+        case RouterCacheEnum.TPM | RouterCacheEnum.RPM:
+            counter = UsageCounter(deployment_id, model, _minute(), "tpm" if kind is RouterCacheEnum.TPM else "rpm")
+            await core.health().usage_store.increment(counter, value, 60)
+        case _:
+            key = kind.value.format(id=deployment_id, model=model, current_minute=_minute())
+            await core.health().store.async_set_cache(key, value)
 
 
 # -- model group info -----------------------------------------------------------------------------

@@ -124,11 +124,11 @@ class RecordingLogging:
 
 
 def counters(core: RouterCore, deployment_id: str, kind: str) -> list[object]:  # mutable-ok: a fresh list
-    """The per-minute ``kind`` (``tpm``, ``rpm``) counters of ``deployment_id`` in the routing cache."""
-    memory: Final = core.health().store.in_memory_cache
+    """The per-minute ``kind`` (``tpm``, ``rpm``) counters of ``deployment_id`` in the usage store."""
+    counted: Final = core.health().usage_store.snapshot()
     return [
-        memory.get_cache(key)
-        for key in tuple(memory.cache_dict)
+        value
+        for key, value in counted.items()
         if key.startswith(f"global_router:{deployment_id}:") and f":{kind}:" in key
     ]
 
@@ -578,10 +578,10 @@ async def test_increment_usage_takes_the_note_back_when_the_count_fails(
     core: Final = make_core(model_list=[deployment("g", "a", model="openai/gpt-4o", rpm=5)])
     metadata: Final = call_metadata()
 
-    async def refused(**kwargs: object) -> None:  # kwargs-ok: the pipeline's arguments
+    async def refused(*args: object) -> None:
         raise ConnectionError("the usage store is down")
 
-    monkeypatch.setattr(core.health().store, "async_increment_cache_pipeline", refused)
+    monkeypatch.setattr(core.health().usage_store, "increment_deployment", refused)
 
     await core.increment_deployment_usage_for_response(completion_response(), {"model": "g", "metadata": metadata})  # pyright: ignore[reportAttributeAccessIssue]  # an old public member
 

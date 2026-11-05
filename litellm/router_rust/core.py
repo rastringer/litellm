@@ -31,6 +31,8 @@ from time import time as unix_time
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeAlias, final
 
+from pydantic import TypeAdapter
+
 from litellm._internal_context import service_target
 from litellm.constants import DEFAULT_COOLDOWN_TIME_SECONDS, HEALTH_CHECKS_TARGET
 from litellm.integrations.custom_guardrail import is_guardrail_intervention
@@ -46,7 +48,7 @@ from litellm.litellm_core_utils.add_retry_fallback_headers import (
 )
 from litellm.litellm_core_utils.agentic_followup_failure import is_agentic_followup_failure
 from litellm.litellm_core_utils.batch_utils import is_batch_retrieve_call_type
-from litellm.litellm_core_utils.core_helpers import as_object_list, as_str_mapping, without
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, without
 from litellm.litellm_core_utils.routing_common_utils import (
     format_content_policy_fallback_hint,
     format_fallback_outcome_message,
@@ -57,6 +59,9 @@ from litellm.litellm_core_utils.routing_common_utils import (
 )
 from litellm.litellm_core_utils.routing_groups import validate_routing_strategy
 from litellm.litellm_core_utils.secret_redaction import redact_string
+from litellm.redis.stores.connection import connect
+from litellm.redis.stores.router_cooldowns import ROUTER_COOLDOWNS_TARGET, RouterCooldownStore
+from litellm.redis.stores.router_usage import ROUTER_USAGE_TARGET, RouterUsage, RouterUsageStore
 from litellm.router_api import (
     ROUTER_INIT_ARGS,
     SETTING_FIELDS,
@@ -103,6 +108,7 @@ from litellm.router_rust.invoke.streaming import (
     shape_attempt_kwargs,
 )
 from litellm.router_rust.invoke.walk import FallbackOutcomes, WalkMetadata, await_all, log_retry_into
+from litellm.router_rust.routing_stores import RoutingStores
 from litellm.router_rust.steps.access import caller_fields, selection_refusal
 from litellm.router_rust.steps.callbacks import OptionalChecks, RustOptionalChecks
 from litellm.router_rust.steps.plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
@@ -199,7 +205,6 @@ from litellm.router_rust.surface.settings import (
     settings_view,
 )
 from litellm.router_strategy.least_busy import CALL_IDENTITY, call_id_of, owning_picks, pick_reserves, picks_reserve
-from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.cooldown_handlers import get_cooldown_deployment_info, mark_deployment_selection_failure
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, selected_endpoint
 from litellm.router_utils.kubernetes_pod_discovery import (
@@ -209,7 +214,6 @@ from litellm.router_utils.kubernetes_pod_discovery import (
 )
 from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check import EncryptedContentAffinityCheck
 from litellm.router_utils.router_callbacks.track_deployment_metrics import find_deployment_metadata
-from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET, RoutingReadBatch
 from litellm.types.router import (
     Deployment,
     RouterErrors,
@@ -1038,6 +1042,10 @@ class RustHealth(RouterHealth):
     def cooldowns(self) -> "CooldownCache":
         return self._core._cooldowns  # pyright: ignore[reportPrivateUsage]  # see above
 
+    @property
+    def usage_store(self) -> RouterUsage:
+        return self._core._usage  # pyright: ignore[reportPrivateUsage]  # see above
+
     def failures_this_minute(self, deployment_id: str) -> int:
         count: Final[object] = self.store.get_cache(f"{deployment_id}:fails", local_only=True)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # DualCache's reads are untyped
         return int(count) if isinstance(count, int | float) else 0
@@ -1313,8 +1321,12 @@ class RustCore(
         self._legacy: Final = legacy
         self._health_view: RustHealth | None = None
         self._cache: DualCache = host.routing_cache(config)
+        redis_connection: Final = connect(self._cache.redis_cache)
+        self._usage: RouterUsage = RouterUsageStore(
+            redis_connection
+        )  # rebind-ok: RustLegacyMembers declares it non-Final
         self._cooldowns: CooldownCache = CooldownCache(
-            cache=self._cache,
+            store=RouterCooldownStore(redis_connection),
             default_cooldown_time=self._cooldown_given,  # pyright: ignore[reportArgumentType]  # the constructor's value, as the Python core passes it
         )
         self._health_checks: DeploymentHealthCache = resolved.health_routing.health_checks(self._cache)
@@ -1342,6 +1354,7 @@ class RustCore(
             on_change=self._sync_registry,
         )
         self._hosted._core_cache = self._cache  # pyright: ignore[reportPrivateUsage]  # usage reads come from the cache the Rust core writes
+        self._hosted._core_usage_store = self._usage  # pyright: ignore[reportPrivateUsage]  # tpm/rpm reads come from the store the Rust core writes
         ctx: Final = RoutingContext(self)  # pyright: ignore[reportArgumentType]  # the strategies read registry(), settings(), health() and select()
         strategies: Final = PreRoutingStrategies(
             self._hosted, host, ctx, config.get("auto_router_capability_limit"), self._cache
@@ -1912,6 +1925,9 @@ class RustCore(
         if changes.redis_cache is not None:
             # `_core_update_redis_cache`: the routing state's cache gains the Redis cache.
             self._cache.attach_redis_cache(changes.redis_cache)
+            redis_connection: Final = connect(changes.redis_cache)
+            self._usage.attach_redis(redis_connection)
+            self._cooldowns.cooldown_store.attach_redis(redis_connection)
             self._checks.prompt_caching_pin_cache.attach_redis_cache(changes.redis_cache)
         return ApplyResult(
             version=self._hosted._registry_version,  # pyright: ignore[reportPrivateUsage]  # see __init__
@@ -2148,6 +2164,8 @@ class RustCore(
     def flush_cache(self) -> None:
         """Drop the host's response cache and the routing state."""
         self._host.set_global_cache(None)
+        self._usage.flush_local_counters()
+        self._cooldowns.cooldown_store.flush_local_counters()
         self._cache.flush_cache()
         self._checks.prompt_caching_pin_cache.in_memory_cache.flush_cache()
 
@@ -3247,59 +3265,25 @@ class RustCore(
 
     # -- cache steps -----------------------------------------------------------------------------
 
-    def _store_for(self, key: str) -> "DualCache":
-        """Cooldowns live in the cooldown store; every other routing key in the routing cache."""
-        return self._cooldowns.cooldown_store if key.endswith(":cooldown") else self._cache
-
     async def _batch_read(self, keys: list[str]) -> Sequence[object]:  # mutable-ok: the cache's key list
-        """One batch read, as the Python core makes it: the keys memory cannot serve, at most once per
-        read interval. Cooldowns are ``async_get_cooldown_deployments``' read, through the request's
-        armed prefetch when there is one."""
-        if not keys or not keys[0].endswith(":cooldown"):
-            read: Final[object] = await self._cache.async_batch_get_cache(keys=keys)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # DualCache's reads are untyped
-            return read if isinstance(read, list) else [None] * len(keys)  # pyright: ignore[reportUnknownVariableType]  # see above
-        store: Final = self._cooldowns.cooldown_store
-        with service_target(ROUTER_COOLDOWNS_TARGET):
-            prefetched: Final = await RoutingReadBatch._read_prefetched(((store, keys),))  # pyright: ignore[reportPrivateUsage]  # the batch's own prefetch read
-            results: Final[object] = (
-                prefetched[0] if prefetched is not None else await store.async_batch_get_cache(keys=keys)  # pyright: ignore[reportUnknownMemberType]  # see above
-            )
-        return self._corrected_cooldowns(keys, results)
+        """One batch read: cooldowns and tpm/rpm usage from their stores, every other key from the routing cache."""
+        stored: Final = await self._stores.batch_get(keys)
+        if stored is not None:
+            return stored
+        read: Final[object] = await self._cache.async_batch_get_cache(keys=keys)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # DualCache's reads are untyped
+        return read if isinstance(read, list) else [None] * len(keys)  # pyright: ignore[reportUnknownVariableType]  # see above
 
     def _batch_read_sync(self, keys: list[str]) -> Sequence[object]:  # mutable-ok: the cache's key list
-        """``_batch_read`` for a sync pick: ``get_active_cooldowns``' read."""
-        if not keys or not keys[0].endswith(":cooldown"):
-            read: Final[object] = self._cache.batch_get_cache(keys=keys)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # DualCache's reads are untyped
-            return read if isinstance(read, list) else [None] * len(keys)  # pyright: ignore[reportUnknownVariableType]  # see above
-        with service_target(ROUTER_COOLDOWNS_TARGET):
-            results: Final = as_object_list(self._cooldowns.cooldown_store.batch_get_cache(keys=keys))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # see above
-        return self._corrected_cooldowns(keys, results)
+        """``_batch_read`` for a sync pick."""
+        stored: Final = self._stores.batch_get_sync(keys)
+        if stored is not None:
+            return stored
+        read: Final[object] = self._cache.batch_get_cache(keys=keys)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # DualCache's reads are untyped
+        return read if isinstance(read, list) else [None] * len(keys)  # pyright: ignore[reportUnknownVariableType]  # see above
 
-    def _corrected_cooldowns(self, keys: Sequence[str], results: object) -> Sequence[object]:
-        """The cooldowns a batch read found, once ``active_cooldowns_from_results`` corrected the in-memory
-        TTL of each it promoted from Redis and dropped each that expired."""
-        if not isinstance(results, list):
-            return [None] * len(keys)
-        ids: Final = [key.removeprefix("deployment:").removesuffix(":cooldown") for key in keys]
-        _ = self._cooldowns.active_cooldowns_from_results(ids, results)  # pyright: ignore[reportUnknownArgumentType]  # see above
-        return results  # pyright: ignore[reportUnknownVariableType]  # see above
-
-    async def _increment_usage(self, keys: Sequence[object], amounts: Sequence[object], ttl: float | None) -> None:
-        """``_increment_deployment_usage``'s write: one pipeline, then this worker's memory holds what
-        Redis answered, so its usage reads see what the other workers counted."""
-        from litellm.types.caching import RedisPipelineIncrementOperation
-
-        operations: Final = [
-            RedisPipelineIncrementOperation(
-                key=str(key), increment_value=_amount(amount), ttl=None if ttl is None else int(ttl)
-            )
-            for key, amount in zip(keys, amounts)
-        ]
-        values: Final = await self._cache.async_increment_cache_pipeline(increment_list=operations)
-        if values is None or self._cache.redis_cache is None:
-            return
-        for operation, value in zip(operations, values):
-            await self._cache.async_set_cache(operation["key"], int(value), local_only=True, ttl=operation["ttl"])  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
+    async def _increment_usage(self, keys: Sequence[object], amounts: Sequence[object]) -> None:
+        if not await self._stores.increment_usage(keys, amounts):
+            raise _not_usage(keys)
 
     async def _answer_cache(self, step: Mapping[str, object]) -> object:
         with service_target(_cache_target(str(step.get("key")))):
@@ -3309,32 +3293,33 @@ class RustCore(
         key: Final = str(step.get("key"))
         ttl: Final = _ttl(step)
         local: Final = step.get("local") is True
+        stored: Final = None if local else await self._stores.answer(step.get("op"), key, step.get("value"), ttl)
+        if stored is not None:
+            return _plain(stored.value)
         match step.get("op"):
             case "get":
-                return _plain(await self._store_for(key).async_get_cache(key, local_only=local))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
+                return _plain(await self._cache.async_get_cache(key, local_only=local))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
             case "batch_get":
                 return _plain(await self._batch_read([str(k) for k in _as_list(step.get("keys"))]))
             case "set":
-                store: Final = self._store_for(key)
                 if ttl is None:
-                    await store.async_set_cache(key, step.get("value"))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
+                    await self._cache.async_set_cache(key, step.get("value"))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
                 else:
-                    await store.async_set_cache(key, step.get("value"), ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
+                    await self._cache.async_set_cache(key, step.get("value"), ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
                 return None
             case "increment":
                 by: Final = _amount(step.get("value"))
-                counter: Final = self._store_for(key)
                 total: Final = (
-                    await counter.async_increment_cache(key, by, local_only=local)  # pyright: ignore[reportUnknownMemberType]  # see above
+                    await self._cache.async_increment_cache(key, by, local_only=local)  # pyright: ignore[reportUnknownMemberType]  # see above
                     if ttl is None
-                    else await counter.async_increment_cache(key, by, local_only=local, ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
+                    else await self._cache.async_increment_cache(key, by, local_only=local, ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
                 )
                 return by if total is None else total
             case "increment_usage":
-                await self._increment_usage(_as_list(step.get("keys")), _as_list(step.get("value")), ttl)
+                await self._increment_usage(_as_list(step.get("keys")), _as_list(step.get("value")))
                 return None
             case "delete":
-                await self._store_for(key).async_delete_cache(key)
+                await self._cache.async_delete_cache(key)
                 return None
             case other:
                 raise RuntimeError(f"router-core asked for an unknown cache op {other!r}")
@@ -3355,6 +3340,16 @@ class RustCore(
         except StopIteration as finished:
             return finished.value  # pyright: ignore[reportAny]  # the coroutine's result
 
+    @property
+    def _stores(self) -> RoutingStores:
+        """The stores router-core's cache steps reach, over the cooldowns as last assigned."""
+        return RoutingStores(self._cooldowns, self._usage)
+
+    def io_token_usage_sync(self, model_group: str) -> tuple[int | None, int | None]:
+        """``get_model_group_io_token_usage``, whose counters stay in the routing cache, on a sync call."""
+        read: Final = self.run_routing_cache_sync(lambda: self._hosted.get_model_group_io_token_usage(model_group))
+        return _IO_TOKEN_USAGE.validate_python(read)
+
     def _answer_cache_sync(self, step: Mapping[str, object]) -> object:
         with service_target(_cache_target(str(step.get("key")))):
             return self._answer_cache_sync_in_target(step)
@@ -3363,34 +3358,36 @@ class RustCore(
         key: Final = str(step.get("key"))
         ttl: Final = _ttl(step)
         local: Final = step.get("local") is True
-        match step.get("op"):
+        op: Final = step.get("op")
+        stored: Final = None if local else self._stores.answer_sync(op, key, step.get("value"), ttl)
+        if stored is not None:
+            return _plain(stored.value)
+        match op:
             case "get":
-                return _plain(self._store_for(key).get_cache(key, local_only=local))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
+                return _plain(self._cache.get_cache(key, local_only=local))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
             case "batch_get":
                 return _plain(self._batch_read_sync([str(k) for k in _as_list(step.get("keys"))]))
             case "set":
-                store: Final = self._store_for(key)
                 if ttl is None:
-                    store.set_cache(key, step.get("value"))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
+                    self._cache.set_cache(key, step.get("value"))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
                 else:
-                    store.set_cache(key, step.get("value"), ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
+                    self._cache.set_cache(key, step.get("value"), ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
                 return None
             case "increment":
                 by: Final = _amount(step.get("value"))
-                counter: Final = self._store_for(key)
                 # DualCache.increment_cache is annotated int but adds floats as given.
                 return (
-                    counter.increment_cache(key, by, local_only=local)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
+                    self._cache.increment_cache(key, by, local_only=local)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
                     if ttl is None
-                    else counter.increment_cache(key, by, local_only=local, ttl=ttl)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
+                    else self._cache.increment_cache(key, by, local_only=local, ttl=ttl)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
                 )
             case "increment_usage":
                 keys: Final = _as_list(step.get("keys"))
-                amounts: Final = _as_list(step.get("value"))
-                self.run_routing_cache_sync(lambda: self._increment_usage(keys, amounts, ttl))
+                if not self._stores.increment_usage_sync(keys, _as_list(step.get("value"))):
+                    raise _not_usage(keys)
                 return None
             case "delete":
-                self._store_for(key).delete_cache(key)  # pyright: ignore[reportUnknownMemberType]  # DualCache's delete is untyped
+                self._cache.delete_cache(key)  # pyright: ignore[reportUnknownMemberType]  # DualCache's delete is untyped
                 return None
             case other:
                 raise RuntimeError(f"router-core asked for an unknown cache op {other!r}")
@@ -3591,6 +3588,13 @@ def _seconds(value: object, default: float) -> float | int:
     if isinstance(value, int | float) and not isinstance(value, bool):
         return value
     return int(default) if float(default).is_integer() else default
+
+
+_IO_TOKEN_USAGE: Final = TypeAdapter(tuple[int | None, int | None])
+
+
+def _not_usage(keys: Sequence[object]) -> RuntimeError:
+    return RuntimeError(f"router-core asked to add usage to keys that are not one deployment's tpm/rpm: {keys!r}")
 
 
 def _ttl(step: Mapping[str, object]) -> float | None:
@@ -4798,11 +4802,10 @@ class _Driver:
         name: Final = self._served[0]
         if name is not None:
             core: Final = self._core
-            remaining: Final = as_str_mapping(
-                core.run_routing_cache_sync(lambda: core.health().usage(name, kind="remaining"))
+            remaining: Final = core._hosted._core_get_remaining_model_group_usage_sync(  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
+                name, core.io_token_usage_sync
             )
-            if remaining is not None:
-                apply_remaining_usage_headers(ensure_response_additional_headers(response), dict(remaining))
+            apply_remaining_usage_headers(ensure_response_additional_headers(response), remaining)
         counted: Final = self._count_response(response, step)
         self.log_outcomes_sync()
         return counted

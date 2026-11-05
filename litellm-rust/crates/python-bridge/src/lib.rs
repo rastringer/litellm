@@ -42,9 +42,21 @@ mod _native {
     #[pymodule_export]
     use crate::redis::client::native_redis_breaker_states;
     #[pymodule_export]
+    use crate::redis::store::auth_cache::NativeAuthCache;
+    #[pymodule_export]
+    use crate::redis::store::rate_limits::NativeRateLimits;
+    #[pymodule_export]
     use crate::redis::store::request::{NativeRequestRedis, NativeSend};
     #[pymodule_export]
-    use crate::redis::store::{NativePending, NativeRedisStoreError};
+    use crate::redis::store::router_usage::NativeRouterUsage;
+    #[pymodule_export]
+    use crate::redis::store::sensitive_route_pins::NativeSensitiveRoutePins;
+    #[pymodule_export]
+    use crate::redis::store::spend_counters::NativeSpendCounters;
+    #[pymodule_export]
+    use crate::redis::store::{
+        NativePending, NativeRedisStoreError, router_cooldowns::NativeRouterCooldowns,
+    };
     #[pymodule_export]
     use crate::router::{RouterCall, RouterCoreHandle};
     #[pymodule_export]
@@ -123,8 +135,14 @@ mod tests {
                 "NativeRedisClient",
                 "NativeRequestRedis",
                 "NativeSend",
+                "NativeAuthCache",
+                "NativeRateLimits",
                 "NativePending",
+                "NativeRouterCooldowns",
+                "NativeRouterUsage",
+                "NativeSensitiveRoutePins",
                 "NativeRedisStoreError",
+                "NativeSpendCounters",
                 "native_redis_breaker_states",
                 "NativeClickHouseSpendConfig",
                 "NativeClickHouseSpendStorage",

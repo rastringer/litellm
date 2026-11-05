@@ -51,21 +51,6 @@ class _RecordingLoggingObject:
         self.messages.append(getattr(kwargs.get("exception"), "message", None))
 
 
-class _RedisAtARoundTrip:
-    """The shared tier of the cooldown store, down to the one thing these tests need of it: a read
-    gives the event loop a turn, as a real Redis round trip does."""
-
-    def __init__(self) -> None:
-        self.batches: list[list[str]] = []  # mutable-ok: the batch reads, in order
-
-    async def async_batch_get_cache(
-        self, key_list: list[str], **_: object
-    ) -> dict[str, object]:  # mutable-ok: as RedisCache
-        self.batches.append(key_list)
-        await asyncio.sleep(0)
-        return dict.fromkeys(key_list)
-
-
 class _RecordingLogging(Logging):
     """A real logging object whose failure handlers only record that they ran."""
 
@@ -97,7 +82,7 @@ async def _let_tasks_run() -> None:
 
 
 async def _failed(core: RouterCore, model: str, **request: object) -> BaseException:  # kwargs-ok: request kwargs
-    with pytest.raises(Exception) as raised:  # noqa: PT011  # any failure: each caller asserts on what it gets back
+    with pytest.raises(Exception) as raised:  # any failure: each caller asserts on what it gets back
         await complete(core, model, **request)
     await _let_tasks_run()
     return raised.value
@@ -121,17 +106,13 @@ async def test_an_unknown_model_is_dispatched_once_with_the_error_raised(make_co
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("behind_redis", [True, False], ids=["redis", "memory"])
-async def test_a_refused_pick_is_logged_before_the_note_when_the_retry_read_yields(
-    make_core: MakeCore, host: ScriptedHost, behind_redis: bool
+async def test_a_refused_pick_is_logged_with_the_note_when_the_retry_read_does_not_yield(
+    make_core: MakeCore, host: ScriptedHost
 ) -> None:
-    """The retry handler reads the cooldowns even for a name with no group: over Redis that hands
-    the loop to the failure log, which so reads the error before the no-fallback note lands on it."""
+    """The retry handler reads the cooldowns even for a name with no group. Without Redis that read never
+    hands the loop to the failure log, so the no-fallback note is on the error before it is logged."""
     show_router_debug(host)
     core: Final = make_core(model_list=list(GROUP_OF_TWO), num_retries=0, fallbacks=[{"a": ["a"]}])
-    redis: Final = _RedisAtARoundTrip()
-    if behind_redis:
-        core.health().store.redis_cache = redis  # pyright: ignore[reportAttributeAccessIssue]  # a double
     logging_obj: Final = _RecordingLoggingObject()
 
     error: Final = await _failed(core, "nope", litellm_logging_obj=logging_obj)
@@ -139,8 +120,7 @@ async def test_a_refused_pick_is_logged_before_the_note_when_the_retry_read_yiel
     note: Final = "no fallback model group was found"
     assert note in str(error)
     (logged,) = logging_obj.messages
-    assert (note in str(logged)) is not behind_redis
-    assert redis.batches == ([["deployment:a1:cooldown", "deployment:a2:cooldown"]] if behind_redis else [])
+    assert note in str(logged)
 
 
 @pytest.mark.asyncio
